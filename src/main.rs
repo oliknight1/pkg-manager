@@ -50,13 +50,13 @@ fn main() {
         Some(deps) => {
             println!("depppps {:?}", deps);
 
-            //TODO: check for the lock file, call get_dep_from_lock if exists
-
             if Path::new("dep-lock.json").exists() {
-                let _ = fetch_dep_from_lock(&client);
+                if let Err(e) = fetch_dep_from_lock(&client) {
+                    eprintln!("Error: {e}")
+                };
             } else {
                 if let Err(e) = fetch_dep(deps, &client) {
-                    println!("Error: {e}")
+                    eprintln!("Error: {e}")
                 }
             }
         }
@@ -68,22 +68,26 @@ fn main() {
 fn fetch_dep_from_lock(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
     let lock = fs::read_to_string("dep-lock.json")?;
     let lock: LockFile = serde_json::from_str(&lock)?;
-    println!("LOCK FILE: {:?}", lock);
     for (key, value) in lock.iter() {
         let url = value.resolved_url.clone();
-        fetch_tarball(url, key.to_string(), client)?
+        if let Err(e) = fetch_tarball(url, key.to_string(), client) {
+            return Err(format!("Error fetching tarball: {e}").into());
+        }
     }
     Ok(())
 }
 
-fn fetch_dep(dependencies: HashMap<String, String>, client: &Client) -> Result<(), Error> {
+fn fetch_dep(
+    dependencies: HashMap<String, String>,
+    client: &Client,
+) -> Result<(), Box<dyn std::error::Error>> {
     for (name, version) in dependencies {
         let matched_version = get_latest_version_name(&name, &version, &client);
         match matched_version {
             Ok(mv) => {
                 println!("matched version: {:?}", mv.dist.tarball);
                 if let Err(e) = fetch_tarball(mv.dist.tarball, name, client) {
-                    eprintln!("Failed to fetch tarball: {}", e);
+                    return Err(format!("Error fetching tarball: {e}").into());
                 }
             }
             Err(e) => {
