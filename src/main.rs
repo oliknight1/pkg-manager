@@ -53,9 +53,9 @@ fn main() {
             //TODO: check for the lock file, call get_dep_from_lock if exists
 
             if Path::new("dep-lock.json").exists() {
-                let _ = get_dep_from_lock(&client);
+                let _ = fetch_dep_from_lock(&client);
             } else {
-                if let Err(e) = handle_dependencies(deps, &client) {
+                if let Err(e) = fetch_dep(deps, &client) {
                     println!("Error: {e}")
                 }
             }
@@ -65,7 +65,7 @@ fn main() {
 }
 
 /// fetch the dependency using the url from lock file
-fn get_dep_from_lock(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
+fn fetch_dep_from_lock(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
     let lock = fs::read_to_string("dep-lock.json")?;
     let lock: LockFile = serde_json::from_str(&lock)?;
     println!("LOCK FILE: {:?}", lock);
@@ -76,10 +76,7 @@ fn get_dep_from_lock(client: &Client) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-fn handle_dependencies(
-    dependencies: HashMap<String, String>,
-    client: &Client,
-) -> Result<(), Error> {
+fn fetch_dep(dependencies: HashMap<String, String>, client: &Client) -> Result<(), Error> {
     for (name, version) in dependencies {
         let matched_version = get_latest_version_name(&name, &version, &client);
         match matched_version {
@@ -88,10 +85,6 @@ fn handle_dependencies(
                 if let Err(e) = fetch_tarball(mv.dist.tarball, name, client) {
                     eprintln!("Failed to fetch tarball: {}", e);
                 }
-
-                //TODO: create lock file
-                // change workflow to:
-                // read dep -> check yarn lock exits, check item exists, check if item version matches package version
             }
             Err(e) => {
                 println!("Error: {e}")
