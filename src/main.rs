@@ -64,7 +64,7 @@ fn main() {
 
     match package_json.dependencies {
         Some(deps) => {
-            if let Err(e) = parse_full_dep_list(deps, &client, &mut lock_file) {
+            if let Err(e) = fetch_dependencies(deps, &client, &mut lock_file) {
                 eprintln!("Error: {e}")
             }
         }
@@ -119,7 +119,7 @@ fn fetch_single_dep(
     Ok(())
 }
 
-fn parse_full_dep_list(
+fn fetch_dependencies(
     dependencies: HashMap<String, String>,
     client: &Client,
     lock_file: &mut LockFile,
