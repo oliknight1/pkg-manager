@@ -2,9 +2,7 @@ use flate2::read::GzDecoder;
 use reqwest::{blocking::Client, Error};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
-use std::io::{self, ErrorKind};
-use std::path::{self, Path};
+use std::path::Path;
 use std::{collections::HashMap, fs, io::Cursor};
 use tar::Archive;
 
@@ -38,6 +36,15 @@ struct LockFileItem {
 }
 type LockFile = HashMap<String, LockFileItem>;
 
+//TODO: 1. Actually create the lock file
+
+//TODO: 2. handle nested dependencies
+
+//TODO: 3. handle different dependency conflicts
+
+//TODO: 4. Start with on demand dependency resolution, then switch to a different data structure.
+// Maybe a tree or a Directed Acylic Graph
+
 fn main() {
     let client = Client::new();
     let json = fs::read_to_string("./package.json").expect("Error reading file");
@@ -48,14 +55,12 @@ fn main() {
 
     match json.dependencies {
         Some(deps) => {
-            println!("depppps {:?}", deps);
-
             if Path::new("dep-lock.json").exists() {
-                if let Err(e) = fetch_dep_from_lock(&client) {
+                if let Err(e) = fetch_dep_from_lock(&client, deps) {
                     eprintln!("Error: {e}")
                 };
             } else {
-                if let Err(e) = fetch_dep(deps, &client) {
+                if let Err(e) = parse_full_dep_list(deps, &client) {
                     eprintln!("Error: {e}")
                 }
             }
@@ -65,45 +70,82 @@ fn main() {
 }
 
 /// fetch the dependency using the url from lock file
-fn fetch_dep_from_lock(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
+fn fetch_dep_from_lock(
+    client: &Client,
+    deps: HashMap<String, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let lock = fs::read_to_string("dep-lock.json")?;
     let lock: LockFile = serde_json::from_str(&lock)?;
-    for (key, value) in lock.iter() {
-        let url = value.resolved_url.clone();
-        if let Err(e) = fetch_tarball(url, key.to_string(), client) {
-            return Err(format!("Error fetching tarball: {e}").into());
+    for (dep_name, lock_meta) in lock.iter() {
+        //TODO: properly error hanlde
+        let package_version = deps.get(dep_name);
+
+        match package_version {
+            Some(v) => {
+                let package_version = VersionReq::parse(v)
+                    .expect("Failed to parse dependency version from package.json");
+
+                let lock_version = Version::parse(&lock_meta.version)
+                    .expect("Failed to parse dependency version from dep-lock.json");
+
+                let update_lock = !package_version.matches(&lock_version);
+
+                // If the version in the lock file satisifies the version in package.json, then download using the
+                // locked url. Else calculate the dependency version
+                if !update_lock {
+                    let url = lock_meta.resolved_url.clone();
+                    println!("lock link: {url}");
+                    if let Err(e) = fetch_tarball(&url, &dep_name.to_string(), client) {
+                        return Err(format!("Error fetching tarball: {e}").into());
+                    }
+                    return Ok(());
+                }
+                fetch_dep(dep_name, &lock_meta.version, client)?
+            }
+            None => fetch_dep(dep_name, &lock_meta.version, client)?,
         }
     }
     Ok(())
 }
 
+/// Fetches single dependency from registry
 fn fetch_dep(
+    name: &String,
+    version: &String,
+    client: &Client,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let matched_version = get_latest_version(name, version, client);
+    match matched_version {
+        Ok(mv) => {
+            println!("matched version: {:?}", mv.dist.tarball);
+            Ok(
+                if let Err(e) = fetch_tarball(&mv.dist.tarball, name, client) {
+                    return Err(format!("Error fetching tarball: {e}").into());
+                },
+            )
+        }
+        Err(e) => {
+            return Err(format!("Error: {e}").into());
+        }
+    }
+}
+
+fn parse_full_dep_list(
     dependencies: HashMap<String, String>,
     client: &Client,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for (name, version) in dependencies {
-        let matched_version = get_latest_version_name(&name, &version, &client);
-        match matched_version {
-            Ok(mv) => {
-                println!("matched version: {:?}", mv.dist.tarball);
-                if let Err(e) = fetch_tarball(mv.dist.tarball, name, client) {
-                    return Err(format!("Error fetching tarball: {e}").into());
-                }
-            }
-            Err(e) => {
-                println!("Error: {e}")
-            }
-        }
+        fetch_dep(&name, &version, client)?
     }
     Ok(())
 }
 
 fn fetch_tarball(
-    url: String,
-    name: String,
+    url: &String,
+    name: &String,
     client: &Client,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let response = client.get(&url).send()?;
+    let response = client.get(url).send()?;
 
     let content = Cursor::new(response.bytes()?);
 
@@ -111,7 +153,7 @@ fn fetch_tarball(
     let mut archive = Archive::new(tar);
     let output_dir = format!("./node_modules/{name}");
 
-    //TODO: need to make sure each dep removes the root directory
+    //NOTE: enhance here to remove a root directory if it has a single dir as the root
     archive.unpack(output_dir)?;
     Ok(())
 }
@@ -121,7 +163,7 @@ fn fetch_tarball(
 /// * `name`: name of the dependency
 /// * `version`: version specified in the package.json
 /// * `client`: reqwest client
-fn get_latest_version_name(
+fn get_latest_version(
     name: &String,
     version: &String,
     client: &Client,
