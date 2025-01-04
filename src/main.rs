@@ -1,8 +1,9 @@
+use base64::encode;
 use flate2::read::GzDecoder;
 use reqwest::{blocking::Client, Error};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
-use std::fs::File;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::{collections::HashMap, fs, io::Cursor};
 use tar::Archive;
@@ -26,6 +27,7 @@ struct RegistryVersionItem {
 
 #[derive(Deserialize, Debug, Clone)]
 struct RegistryDist {
+    integrity: String,
     tarball: String,
 }
 
@@ -99,19 +101,30 @@ fn fetch_single_dep(
             .expect("Failed to parse dependency version from dep-lock.json");
 
         if package_version.matches(&lock_version) {
-            fetch_tarball(&lock_item.resolved_url, name, client)?;
+            fetch_tarball(
+                &lock_item.resolved_url,
+                name,
+                client,
+                Some(lock_item.integrity.clone()),
+            )?;
             return Ok(());
         }
     }
     let matched_version = get_latest_version(name, version, client)?;
-    fetch_tarball(&matched_version.dist.tarball, name, client)?;
+    let integrity = matched_version.dist.integrity;
+    fetch_tarball(
+        &matched_version.dist.tarball,
+        name,
+        client,
+        Some(integrity.clone()),
+    )?;
 
     lock_file.insert(
         name.to_string(),
         LockFileItem {
             version: matched_version.version,
             resolved_url: matched_version.dist.tarball,
-            integrity: "integrity-placeholder".to_string(),
+            integrity,
             dependencies: Vec::new(),
         },
     );
@@ -134,10 +147,27 @@ fn fetch_tarball(
     url: &String,
     name: &String,
     client: &Client,
+    expected_integrity: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let response = client.get(url).send()?;
-
     let content = Cursor::new(response.bytes()?);
+
+    if let Some(expected_hash) = expected_integrity {
+        // Compute and validate the hash
+        let mut hasher = Sha256::new();
+        hasher.update(content.get_ref());
+        let computed_hash = encode(&hasher.finalize());
+
+        if expected_hash != computed_hash {
+            return Err(format!(
+                "Integrity check failed for {name}. Expected {expected_hash}, got {computed_hash}"
+            )
+            .into());
+        }
+        println!("Integrity check passed for {name}");
+    } else {
+        println!("No integrity hash provided for {name}. Skipping validation.");
+    }
 
     let tar = GzDecoder::new(content);
     let mut archive = Archive::new(tar);
