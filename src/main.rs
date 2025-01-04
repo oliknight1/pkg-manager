@@ -2,6 +2,7 @@ use flate2::read::GzDecoder;
 use reqwest::{blocking::Client, Error};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
+use std::fs::File;
 use std::path::Path;
 use std::{collections::HashMap, fs, io::Cursor};
 use tar::Archive;
@@ -19,6 +20,7 @@ struct RegistryResponse {
 
 #[derive(Deserialize, Debug, Clone)]
 struct RegistryVersionItem {
+    version: String,
     dist: RegistryDist,
 }
 
@@ -36,8 +38,6 @@ struct LockFileItem {
 }
 type LockFile = HashMap<String, LockFileItem>;
 
-//TODO: 1. Actually create the lock file
-
 //TODO: 2. handle nested dependencies
 
 //TODO: 3. handle different dependency conflicts
@@ -45,97 +45,87 @@ type LockFile = HashMap<String, LockFileItem>;
 //TODO: 4. Start with on demand dependency resolution, then switch to a different data structure.
 // Maybe a tree or a Directed Acylic Graph
 
+const LOCK_FILE_PATH: &str = "dep-lock.json";
+const PACKAGE_JSON_PATH: &str = "package.json";
+
 fn main() {
     let client = Client::new();
-    let json = fs::read_to_string("./package.json").expect("Error reading file");
+    let package_json = fs::read_to_string(PACKAGE_JSON_PATH).expect("Error reading file");
 
-    let json: PackageJSON = serde_json::from_str(&json).expect("Error reading json");
+    let package_json: PackageJSON =
+        serde_json::from_str(&package_json).expect("Error reading json");
 
-    println!("{:#?}", json);
+    let mut lock_file: LockFile = if Path::new(LOCK_FILE_PATH).exists() {
+        let lock_content = fs::read_to_string(LOCK_FILE_PATH).expect("Error reading lock file");
+        serde_json::from_str(&lock_content).expect("Error parsing lock file")
+    } else {
+        HashMap::new()
+    };
 
-    match json.dependencies {
+    match package_json.dependencies {
         Some(deps) => {
-            if Path::new("dep-lock.json").exists() {
-                if let Err(e) = fetch_dep_from_lock(&client, deps) {
-                    eprintln!("Error: {e}")
-                };
-            } else {
-                if let Err(e) = parse_full_dep_list(deps, &client) {
-                    eprintln!("Error: {e}")
-                }
+            if let Err(e) = parse_full_dep_list(deps, &client, &mut lock_file) {
+                eprintln!("Error: {e}")
             }
         }
         None => println!("No dependencies"),
     }
+
+    if let Err(e) = write_lock_file(&lock_file) {
+        eprintln!("Failed to write to lock file: {e}")
+    }
 }
 
-/// fetch the dependency using the url from lock file
-fn fetch_dep_from_lock(
-    client: &Client,
-    deps: HashMap<String, String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let lock = fs::read_to_string("dep-lock.json")?;
-    let lock: LockFile = serde_json::from_str(&lock)?;
-    for (dep_name, lock_meta) in lock.iter() {
-        //TODO: properly error hanlde
-        let package_version = deps.get(dep_name);
-
-        match package_version {
-            Some(v) => {
-                let package_version = VersionReq::parse(v)
-                    .expect("Failed to parse dependency version from package.json");
-
-                let lock_version = Version::parse(&lock_meta.version)
-                    .expect("Failed to parse dependency version from dep-lock.json");
-
-                let update_lock = !package_version.matches(&lock_version);
-
-                // If the version in the lock file satisifies the version in package.json, then download using the
-                // locked url. Else calculate the dependency version
-                if !update_lock {
-                    let url = lock_meta.resolved_url.clone();
-                    println!("lock link: {url}");
-                    if let Err(e) = fetch_tarball(&url, &dep_name.to_string(), client) {
-                        return Err(format!("Error fetching tarball: {e}").into());
-                    }
-                    return Ok(());
-                }
-                fetch_dep(dep_name, &lock_meta.version, client)?
-            }
-            None => fetch_dep(dep_name, &lock_meta.version, client)?,
-        }
-    }
+fn write_lock_file(lock_file: &LockFile) -> Result<(), Box<dyn std::error::Error>> {
+    let json = serde_json::to_string_pretty(lock_file)?;
+    fs::write(LOCK_FILE_PATH, json)?;
+    println!("Wrote lock file");
     Ok(())
 }
 
 /// Fetches single dependency from registry
-fn fetch_dep(
+fn fetch_single_dep(
     name: &String,
     version: &String,
     client: &Client,
+    lock_file: &mut LockFile,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let matched_version = get_latest_version(name, version, client);
-    match matched_version {
-        Ok(mv) => {
-            println!("matched version: {:?}", mv.dist.tarball);
-            Ok(
-                if let Err(e) = fetch_tarball(&mv.dist.tarball, name, client) {
-                    return Err(format!("Error fetching tarball: {e}").into());
-                },
-            )
-        }
-        Err(e) => {
-            return Err(format!("Error: {e}").into());
+    // Check if dependency exits in lock file
+    if let Some(lock_item) = lock_file.get(name) {
+        let package_version = VersionReq::parse(version)
+            .expect("Failed to parse dependency version from package.json");
+
+        let lock_version = Version::parse(&lock_item.version)
+            .expect("Failed to parse dependency version from dep-lock.json");
+
+        if package_version.matches(&lock_version) {
+            fetch_tarball(&lock_item.resolved_url, name, client)?;
+            return Ok(());
         }
     }
+    let matched_version = get_latest_version(name, version, client)?;
+    fetch_tarball(&matched_version.dist.tarball, name, client)?;
+
+    lock_file.insert(
+        name.to_string(),
+        LockFileItem {
+            version: matched_version.version,
+            resolved_url: matched_version.dist.tarball,
+            integrity: "integrity-placeholder".to_string(),
+            dependencies: Vec::new(),
+        },
+    );
+
+    Ok(())
 }
 
 fn parse_full_dep_list(
     dependencies: HashMap<String, String>,
     client: &Client,
+    lock_file: &mut LockFile,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for (name, version) in dependencies {
-        fetch_dep(&name, &version, client)?
+        fetch_single_dep(&name, &version, client, lock_file)?
     }
     Ok(())
 }
