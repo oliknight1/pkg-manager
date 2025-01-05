@@ -1,9 +1,10 @@
-use base64::encode;
+use base64::Engine;
+use base64::{encode, engine::general_purpose};
 use flate2::read::GzDecoder;
 use reqwest::{blocking::Client, Error};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha512};
 use std::path::Path;
 use std::{collections::HashMap, fs, io::Cursor};
 use tar::Archive;
@@ -23,6 +24,9 @@ struct RegistryResponse {
 struct RegistryVersionItem {
     version: String,
     dist: RegistryDist,
+    dependencies: Option<HashMap<String, String>>,
+    // #[serde(rename = "devDependencies")]
+    // dev_dependencies: HashMap<String, String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -36,13 +40,14 @@ struct LockFileItem {
     version: String,
     resolved_url: String,
     integrity: String,
-    dependencies: Vec<String>,
+    dependencies: Option<HashMap<String, String>>,
 }
 type LockFile = HashMap<String, LockFileItem>;
 
-//TODO: 2. handle nested dependencies
-
 //TODO: 3. handle different dependency conflicts
+// If there is a conflicting version, the dependency should have it's own node_modules folder
+
+//TODO: Handle devDependencies
 
 //TODO: 4. Start with on demand dependency resolution, then switch to a different data structure.
 // Maybe a tree or a Directed Acylic Graph
@@ -107,25 +112,39 @@ fn fetch_single_dep(
                 client,
                 Some(lock_item.integrity.clone()),
             )?;
+            match &lock_item.dependencies {
+                Some(deps) => {
+                    fetch_dependencies(deps.clone(), client, lock_file)?;
+                }
+                None => {}
+            }
             return Ok(());
         }
     }
-    let matched_version = get_latest_version(name, version, client)?;
-    let integrity = matched_version.dist.integrity;
+    let matched_dependency = get_latest_version(name, version, client)?;
+    println!("matched : {:?}", matched_dependency);
+    let integrity = matched_dependency.dist.integrity;
+    println!("dist integrity {integrity}");
     fetch_tarball(
-        &matched_version.dist.tarball,
+        &matched_dependency.dist.tarball,
         name,
         client,
         Some(integrity.clone()),
     )?;
+    match matched_dependency.dependencies {
+        Some(ref deps) => {
+            fetch_dependencies(deps.clone(), client, lock_file)?;
+        }
+        None => {}
+    }
 
     lock_file.insert(
         name.to_string(),
         LockFileItem {
-            version: matched_version.version,
-            resolved_url: matched_version.dist.tarball,
+            version: matched_dependency.version,
+            resolved_url: matched_dependency.dist.tarball,
             integrity,
-            dependencies: Vec::new(),
+            dependencies: matched_dependency.dependencies,
         },
     );
 
@@ -149,18 +168,28 @@ fn fetch_tarball(
     client: &Client,
     expected_integrity: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Fetch the tarball as raw bytes
     let response = client.get(url).send()?;
-    let content = Cursor::new(response.bytes()?);
+    let content_bytes = response.bytes()?; // Collect the response bytes
 
+    // Perform the integrity check if an expected hash is provided
     if let Some(expected_hash) = expected_integrity {
-        // Compute and validate the hash
-        let mut hasher = Sha256::new();
-        hasher.update(content.get_ref());
-        let computed_hash = encode(&hasher.finalize());
+        // Split to check hash algorithm (e.g., "sha512-...")
+        let parts: Vec<&str> = expected_hash.split('-').collect();
+        if parts.len() != 2 || parts[0] != "sha512" {
+            return Err(format!("Unsupported hash algorithm in {expected_hash}").into());
+        }
+        let expected_hash_value = parts[1];
 
-        if expected_hash != computed_hash {
+        // Compute the SHA-512 hash
+        let mut hasher = Sha512::new();
+        hasher.update(&content_bytes);
+        let computed_hash = general_purpose::STANDARD.encode(hasher.finalize());
+
+        // Compare the computed hash with the expected hash
+        if expected_hash_value != computed_hash {
             return Err(format!(
-                "Integrity check failed for {name}. Expected {expected_hash}, got {computed_hash}"
+                "Integrity check failed for {name}. Expected {expected_hash_value}, got {computed_hash}"
             )
             .into());
         }
@@ -169,11 +198,13 @@ fn fetch_tarball(
         println!("No integrity hash provided for {name}. Skipping validation.");
     }
 
-    let tar = GzDecoder::new(content);
+    // Unpack the tarball using a cursor
+    let cursor = Cursor::new(&content_bytes);
+    let tar = GzDecoder::new(cursor);
     let mut archive = Archive::new(tar);
     let output_dir = format!("./node_modules/{name}");
 
-    //NOTE: enhance here to remove a root directory if it has a single dir as the root
+    // Unpack the tarball
     archive.unpack(output_dir)?;
     Ok(())
 }
