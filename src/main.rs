@@ -1,5 +1,5 @@
+use base64::engine::general_purpose;
 use base64::Engine;
-use base64::{encode, engine::general_purpose};
 use flate2::read::GzDecoder;
 use reqwest::{blocking::Client, Error};
 use semver::{Version, VersionReq};
@@ -44,12 +44,9 @@ struct LockFileItem {
 }
 type LockFile = HashMap<String, LockFileItem>;
 
-//TODO: 3. handle different dependency conflicts
-// If there is a conflicting version, the dependency should have it's own node_modules folder
-
 //TODO: Handle devDependencies
 
-//TODO: 4. Start with on demand dependency resolution, then switch to a different data structure.
+//TODO: Start with on demand dependency resolution, then switch to a different data structure.
 // Maybe a tree or a Directed Acylic Graph
 
 const LOCK_FILE_PATH: &str = "dep-lock.json";
@@ -71,7 +68,7 @@ fn main() {
 
     match package_json.dependencies {
         Some(deps) => {
-            if let Err(e) = fetch_dependencies(deps, &client, &mut lock_file) {
+            if let Err(e) = fetch_dependencies(deps, &client, &mut lock_file, None) {
                 eprintln!("Error: {e}")
             }
         }
@@ -96,8 +93,14 @@ fn fetch_single_dep(
     version: &String,
     client: &Client,
     lock_file: &mut LockFile,
+    parent_node_modules: Option<&String>, // Parent directory for nested `node_modules`
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Check if dependency exits in lock file
+    let dependency_folder = match parent_node_modules {
+        Some(parent) => format!("{}/node_modules", parent),
+        None => "./node_modules".to_string(),
+    };
+
+    // Check if dependency exists in the lock file
     if let Some(lock_item) = lock_file.get(name) {
         let package_version = VersionReq::parse(version)
             .expect("Failed to parse dependency version from package.json");
@@ -106,45 +109,46 @@ fn fetch_single_dep(
             .expect("Failed to parse dependency version from dep-lock.json");
 
         if package_version.matches(&lock_version) {
+            // Dependency already resolved and matches the required version
             fetch_tarball(
                 &lock_item.resolved_url,
                 name,
                 client,
                 Some(lock_item.integrity.clone()),
+                &dependency_folder,
             )?;
-            match &lock_item.dependencies {
-                Some(deps) => {
-                    fetch_dependencies(deps.clone(), client, lock_file)?;
-                }
-                None => {}
+            if let Some(deps) = &lock_item.dependencies {
+                fetch_dependencies(deps.clone(), client, lock_file, Some(&dependency_folder))?;
             }
             return Ok(());
         }
     }
+
+    // Fetch the latest compatible version
     let matched_dependency = get_latest_version(name, version, client)?;
-    println!("matched : {:?}", matched_dependency);
-    let integrity = matched_dependency.dist.integrity;
-    println!("dist integrity {integrity}");
+    println!("Matched: {:?}", matched_dependency);
+
+    let integrity = matched_dependency.dist.integrity.clone();
     fetch_tarball(
         &matched_dependency.dist.tarball,
         name,
         client,
         Some(integrity.clone()),
+        &dependency_folder,
     )?;
-    match matched_dependency.dependencies {
-        Some(ref deps) => {
-            fetch_dependencies(deps.clone(), client, lock_file)?;
-        }
-        None => {}
+
+    if let Some(deps) = &matched_dependency.dependencies {
+        fetch_dependencies(deps.clone(), client, lock_file, Some(&dependency_folder))?;
     }
 
+    // Update the lock file
     lock_file.insert(
         name.to_string(),
         LockFileItem {
             version: matched_dependency.version,
             resolved_url: matched_dependency.dist.tarball,
             integrity,
-            dependencies: matched_dependency.dependencies,
+            dependencies: matched_dependency.dependencies.clone(),
         },
     );
 
@@ -155,9 +159,10 @@ fn fetch_dependencies(
     dependencies: HashMap<String, String>,
     client: &Client,
     lock_file: &mut LockFile,
+    parent_node_modules: Option<&String>, // Parent directory for nested `node_modules`
 ) -> Result<(), Box<dyn std::error::Error>> {
     for (name, version) in dependencies {
-        fetch_single_dep(&name, &version, client, lock_file)?
+        fetch_single_dep(&name, &version, client, lock_file, parent_node_modules)?;
     }
     Ok(())
 }
@@ -167,26 +172,22 @@ fn fetch_tarball(
     name: &String,
     client: &Client,
     expected_integrity: Option<String>,
+    output_dir: &String, // Directory where the dependency will be installed
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Fetch the tarball as raw bytes
     let response = client.get(url).send()?;
-    let content_bytes = response.bytes()?; // Collect the response bytes
+    let content_bytes = response.bytes()?;
 
-    // Perform the integrity check if an expected hash is provided
     if let Some(expected_hash) = expected_integrity {
-        // Split to check hash algorithm (e.g., "sha512-...")
         let parts: Vec<&str> = expected_hash.split('-').collect();
         if parts.len() != 2 || parts[0] != "sha512" {
             return Err(format!("Unsupported hash algorithm in {expected_hash}").into());
         }
         let expected_hash_value = parts[1];
 
-        // Compute the SHA-512 hash
         let mut hasher = Sha512::new();
         hasher.update(&content_bytes);
         let computed_hash = general_purpose::STANDARD.encode(hasher.finalize());
 
-        // Compare the computed hash with the expected hash
         if expected_hash_value != computed_hash {
             return Err(format!(
                 "Integrity check failed for {name}. Expected {expected_hash_value}, got {computed_hash}"
@@ -198,14 +199,13 @@ fn fetch_tarball(
         println!("No integrity hash provided for {name}. Skipping validation.");
     }
 
-    // Unpack the tarball using a cursor
     let cursor = Cursor::new(&content_bytes);
     let tar = GzDecoder::new(cursor);
     let mut archive = Archive::new(tar);
-    let output_dir = format!("./node_modules/{name}");
 
     // Unpack the tarball
-    archive.unpack(output_dir)?;
+    let dependency_path = format!("{}/{}", output_dir, name);
+    archive.unpack(&dependency_path)?;
     Ok(())
 }
 
