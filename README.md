@@ -4,11 +4,11 @@
 This is a simple package manager implemented in Rust, primarily created as a learning project. It aims to mimic some of the basic functionalities of package managers like npm.
 
 ## Key Features
-Dependency Resolution: The package manager resolves dependencies defined in a package.json file.
-Lock File: It supports lock files (dep-lock.json) for consistent versioning and dependency management.
-Tarball Fetching: Dependencies are fetched as .tar.gz archives from a registry (e.g., npm) and extracted into a local node_modules folder.
-Integrity Check: Ensures that downloaded dependencies match their integrity hash to verify their authenticity.
-Version Conflict Handling: Basic handling for version conflicts, where a dependency may require different versions of the same library.
+- **Dependency Resolution**: The package manager resolves dependencies defined in a package.json file.
+- **Lock File**: It supports lock files (dep-lock.json) for consistent versioning and dependency management.
+- **Tarball Fetching**: Dependencies are fetched as .tar.gz archives from a registry (e.g., npm) and extracted into a local node_modules folder.
+- **Integrity Check**: Ensures that downloaded dependencies match their integrity hash to verify their authenticity.
+- **Version Conflict Handling**: Basic handling for version conflicts, where a dependency may require different versions of the same library.
 
 
 ## Installation
